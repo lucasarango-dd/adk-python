@@ -2221,6 +2221,22 @@ class LiteLlm(BaseLlm):
           completion_args.get("headers")
       )
 
+    # Forward request-scoped http_options.headers as extra_headers.
+    # LiteLLM's acompletion doesn't consume http_options natively, so
+    # headers set via before_model_callback must be extracted explicitly.
+    # Always shallow-copy extra_headers to avoid mutating self._additional_args.
+    request_headers = (
+        llm_request.config.http_options.headers
+        if llm_request.config.http_options
+        and llm_request.config.http_options.headers
+        else {}
+    )
+    if completion_args.get("extra_headers") or request_headers:
+      completion_args["extra_headers"] = {
+          **(completion_args.get("extra_headers") or {}),
+          **request_headers,
+      }
+
     if generation_params:
       completion_args.update(generation_params)
 

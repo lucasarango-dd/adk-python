@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -4894,3 +4895,211 @@ async def test_content_to_message_param_anthropic_no_signature_falls_back():
   # Falls back to reasoning_content when no signatures present
   assert result.get("reasoning_content") == "thinking without sig"
   assert "thinking_blocks" not in result
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_forwards_request_scoped_headers():
+  """Request-scoped http_options.headers are forwarded as extra_headers."""
+  mock_acompletion = AsyncMock(
+      return_value=ModelResponse(
+          choices=[
+              Choices(
+                  message=ChatCompletionAssistantMessage(
+                      role="assistant", content="ok"
+                  ),
+                  finish_reason="stop",
+              )
+          ],
+          model="test_model",
+      )
+  )
+  client = MockLLMClient(mock_acompletion, Mock())
+  llm = LiteLlm(model="test_model", llm_client=client)
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(role="user", parts=[types.Part.from_text(text="hi")])
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(headers={"x-test-header": "abc"})
+      ),
+  )
+
+  async for _ in llm.generate_content_async(llm_request):
+    pass
+
+  _, kwargs = mock_acompletion.call_args
+  assert kwargs["extra_headers"] == {"x-test-header": "abc"}
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_merges_static_and_request_headers():
+  """Static extra_headers from constructor merge with request-scoped headers."""
+  mock_acompletion = AsyncMock(
+      return_value=ModelResponse(
+          choices=[
+              Choices(
+                  message=ChatCompletionAssistantMessage(
+                      role="assistant", content="ok"
+                  ),
+                  finish_reason="stop",
+              )
+          ],
+          model="test_model",
+      )
+  )
+  client = MockLLMClient(mock_acompletion, Mock())
+  llm = LiteLlm(
+      model="test_model",
+      llm_client=client,
+      extra_headers={"x-static": "s1"},
+  )
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(role="user", parts=[types.Part.from_text(text="hi")])
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(headers={"x-request": "r1"})
+      ),
+  )
+
+  async for _ in llm.generate_content_async(llm_request):
+    pass
+
+  _, kwargs = mock_acompletion.call_args
+  assert kwargs["extra_headers"]["x-static"] == "s1"
+  assert kwargs["extra_headers"]["x-request"] == "r1"
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_request_headers_override_static():
+  """Request-scoped headers override duplicate static keys for that call."""
+  mock_acompletion = AsyncMock(
+      return_value=ModelResponse(
+          choices=[
+              Choices(
+                  message=ChatCompletionAssistantMessage(
+                      role="assistant", content="ok"
+                  ),
+                  finish_reason="stop",
+              )
+          ],
+          model="test_model",
+      )
+  )
+  client = MockLLMClient(mock_acompletion, Mock())
+  llm = LiteLlm(
+      model="test_model",
+      llm_client=client,
+      extra_headers={"x-key": "static-value"},
+  )
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(role="user", parts=[types.Part.from_text(text="hi")])
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(headers={"x-key": "request-value"})
+      ),
+  )
+
+  async for _ in llm.generate_content_async(llm_request):
+    pass
+
+  _, kwargs = mock_acompletion.call_args
+  assert kwargs["extra_headers"]["x-key"] == "request-value"
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_concurrent_requests_isolate_headers():
+  """Concurrent requests on same LiteLlm instance keep their own headers."""
+  call_records = []
+
+  async def recording_acompletion(model, messages, tools, **kwargs):
+    call_records.append(dict(kwargs))
+    return ModelResponse(
+        choices=[
+            Choices(
+                message=ChatCompletionAssistantMessage(
+                    role="assistant", content="ok"
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model="test_model",
+    )
+
+  mock_acompletion = AsyncMock(side_effect=recording_acompletion)
+  client = MockLLMClient(mock_acompletion, Mock())
+  llm = LiteLlm(model="test_model", llm_client=client)
+
+  async def make_request(header_value):
+    llm_request = LlmRequest(
+        contents=[
+            types.Content(role="user", parts=[types.Part.from_text(text="hi")])
+        ],
+        config=types.GenerateContentConfig(
+            http_options=types.HttpOptions(headers={"x-trace-id": header_value})
+        ),
+    )
+    async for _ in llm.generate_content_async(llm_request):
+      pass
+
+  await asyncio.gather(
+      make_request("trace-1"),
+      make_request("trace-2"),
+  )
+
+  headers_seen = [r["extra_headers"]["x-trace-id"] for r in call_records]
+  assert sorted(headers_seen) == ["trace-1", "trace-2"]
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_does_not_mutate_static_extra_headers():
+  """Static extra_headers in _additional_args are not mutated by requests."""
+  mock_acompletion = AsyncMock(
+      return_value=ModelResponse(
+          choices=[
+              Choices(
+                  message=ChatCompletionAssistantMessage(
+                      role="assistant", content="ok"
+                  ),
+                  finish_reason="stop",
+              )
+          ],
+          model="test_model",
+      )
+  )
+  client = MockLLMClient(mock_acompletion, Mock())
+  llm = LiteLlm(
+      model="test_model",
+      llm_client=client,
+      extra_headers={"x-static": "original"},
+  )
+
+  original_static = dict(llm._additional_args["extra_headers"])
+
+  # Call with request headers that add a key
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(role="user", parts=[types.Part.from_text(text="hi")])
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(headers={"x-new": "value"})
+      ),
+  )
+  async for _ in llm.generate_content_async(llm_request):
+    pass
+
+  # Call without request headers
+  llm_request_no_headers = LlmRequest(
+      contents=[
+          types.Content(role="user", parts=[types.Part.from_text(text="hi")])
+      ],
+  )
+  async for _ in llm.generate_content_async(llm_request_no_headers):
+    pass
+
+  # Static headers must remain unchanged
+  assert llm._additional_args["extra_headers"] == original_static
